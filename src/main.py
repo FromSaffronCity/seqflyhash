@@ -5,57 +5,76 @@ import torch.nn as nn
 
 import random
 
+# Nucleotide base or amino acid residue to index mapping, required for one-hot encoding of sequences
 nucleotides_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
-np.random.seed(seed=42)
-torch.manual_seed(seed=42)
+# Setting seeds of pseudo-random number generators for reproducing results
+np.random.seed(seed=42); torch.manual_seed(seed=42)
 
-conv1d_out_channels = 1
-conv1d_kernel_size = 5
+# Hyperparameters of 1D convolution module for capturing local k-mer patterns
+conv1d_out_channels = 1; conv1d_kernel_size = 5
 
-projection_dimension = 1000
-sparsification_fraction = 0.1
-wta_fraction = 0.2
+# Hyperparameters of projection submodule for expanded hash code generation
+projection_dimension = 1000; sparsification_fraction = 0.1; do_binary_projection = False
 
-do_binary_projection = False
-do_binary_wta = False
+# Hyperparameters of winner-take-all (WTA) thresholding submodule for sparse hash code generation
+wta_fraction = 0.2; do_binary_wta = False
 
-if __name__ == "__main__":
-    dna_seq = "ACGTAGCTACGTATGC"
+def generate_seq_hash_code(sequence: str, verbose: bool) -> np.ndarray:
+    if verbose:
+        print(f"generate_seq_hash_code: sequence.length = {len(sequence)}")
     
-    onehot_seq_hash = np.zeros(shape=(len(dna_seq), len(nucleotides_map)), dtype=np.float32)
+    # Generating one-hot encoded feature matrix of input sequence
+    onehot_seq_hash = np.zeros(shape=(len(sequence), len(nucleotides_map)), dtype=np.float32)
 
-    for seq_idx, nucleotide in enumerate(dna_seq):
+    for seq_pos_idx, nucleotide in enumerate(sequence):
         if nucleotide in nucleotides_map:
-            onehot_seq_hash[seq_idx, nucleotides_map[nucleotide]] = 1
+            onehot_seq_hash[seq_pos_idx, nucleotides_map[nucleotide]] = 1
     
+    if verbose:
+        print(f"generate_seq_hash_code: onehot_seq_hash.shape = {onehot_seq_hash.shape}")
+    
+    # Applying 1D convolution to one-hot encoded feature matrix for capturing local motifs and producing feature map with reduced dimension
     conv1d = nn.Conv1d(in_channels=len(nucleotides_map), out_channels=conv1d_out_channels, kernel_size=conv1d_kernel_size)
 
-    conv_seq_hash = conv1d(torch.from_numpy(onehot_seq_hash.T)).detach().numpy().T
+    convoluted_seq_hash = conv1d(torch.from_numpy(onehot_seq_hash.T)).detach().numpy().T
 
-    flat_conv_seq_hash = np.reshape(a=conv_seq_hash, newshape=(conv_seq_hash.size,))
+    if verbose:
+        print(f"generate_seq_hash_code: convoluted_seq_hash.shape = {convoluted_seq_hash.shape}")
+    
+    # Flattening feature map to obtain 1-dimensional feature vector
+    flat_convoluted_seq_hash = np.reshape(a=convoluted_seq_hash, newshape=(convoluted_seq_hash.size,))
 
+    if verbose:
+        print(f"generate_seq_hash_code: flat_convoluted_seq_hash.shape = {flat_convoluted_seq_hash.shape}")
+    
+    # Generating projection matrix for eventual expansion of feature vector
     projection_matrix = None
 
     if do_binary_projection:
-        projection_matrix = np.ones(shape=(projection_dimension, flat_conv_seq_hash.size), dtype=np.float32)
+        projection_matrix = np.ones(shape=(projection_dimension, flat_convoluted_seq_hash.size), dtype=np.float32)
     else:
-        projection_matrix = np.random.normal(loc=0, scale=1, size=(projection_dimension, flat_conv_seq_hash.size))
-
-    for projection_idx in range(projection_dimension):
-        sparsification_indices = random.sample(population=range(flat_conv_seq_hash.size), k=int((1 - sparsification_fraction) * flat_conv_seq_hash.size))
-
-        projection_matrix[projection_idx, sparsification_indices] = 0
+        projection_matrix = np.random.normal(loc=0, scale=1, size=(projection_dimension, flat_convoluted_seq_hash.size))
     
-    wta_projected_seq_hash = projection_matrix @ flat_conv_seq_hash
+    for projection_dim_idx in range(projection_dimension):
+        sparsification_indices = random.sample(population=range(flat_convoluted_seq_hash.size), k=int((1 - sparsification_fraction) * flat_convoluted_seq_hash.size))
 
-    wta_indices = np.argsort(a=wta_projected_seq_hash)[:: -1][int(wta_fraction * wta_projected_seq_hash.size):]
+        projection_matrix[projection_dim_idx, sparsification_indices] = 0
+    
+    wta_projected_seq_hash = projection_matrix @ flat_convoluted_seq_hash
 
-    wta_projected_seq_hash[wta_indices] = 0
+    # Generating sparse expanded hash code with WTA mechanism
+    wta_indices = np.argsort(a=wta_projected_seq_hash)[:: -1]
+
+    wta_projected_seq_hash[wta_indices[int(wta_fraction * wta_projected_seq_hash.size):]] = 0
 
     if do_binary_wta:
-        wta_indices = np.argsort(a=wta_projected_seq_hash)[:: -1][: int(wta_fraction * wta_projected_seq_hash.size)]
-
-        wta_projected_seq_hash[wta_indices] = 1
+        wta_projected_seq_hash[wta_indices[: int(wta_fraction * wta_projected_seq_hash.size)]] = 1
     
-    print(wta_projected_seq_hash)
+    if verbose:
+        print(f"generate_seq_hash_code: wta_projected_seq_hash.shape = {wta_projected_seq_hash.shape}")
+    
+    return wta_projected_seq_hash
+
+if __name__ == "__main__":
+    pass
