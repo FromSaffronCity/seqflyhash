@@ -4,12 +4,10 @@ import torch
 import torch.nn as nn
 
 import random
+import sys
 
 # Nucleotide base or amino acid residue to index mapping, required for one-hot encoding of sequences
 nucleotides_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
-
-# Setting seeds of pseudo-random number generators for reproducing results
-np.random.seed(seed=42); torch.manual_seed(seed=42)
 
 # Hyperparameters of 1D convolution module for capturing local k-mer patterns
 conv1d_out_channels = 1; conv1d_kernel_size = 5
@@ -21,6 +19,9 @@ projection_dimension = 1000; sparsification_fraction = 0.1; do_binary_projection
 wta_fraction = 0.2; do_binary_wta = False
 
 def generate_seq_hash_code(sequence: str, verbose: bool) -> np.ndarray:
+    # Setting seeds of pseudo-random number generators for reusing same weight components
+    np.random.seed(seed=42); torch.manual_seed(seed=42); random.seed(a=42)
+
     if verbose:
         print(f"generate_seq_hash_code: sequence.length = {len(sequence)}")
     
@@ -77,4 +78,39 @@ def generate_seq_hash_code(sequence: str, verbose: bool) -> np.ndarray:
     return wta_projected_seq_hash
 
 if __name__ == "__main__":
-    pass
+    assert len(sys.argv) == 2, "Invalid number of command-line arguments provided!"
+    
+    input_seq_pairs_file_path = sys.argv[1]; num_seq_pairs = None
+
+    with open(file=input_seq_pairs_file_path, mode='r') as input_seq_pairs_file:
+        input_seq_pairs = [input_sequence for input_sequence in input_seq_pairs_file.read().split('\n') if input_sequence != '']
+
+        num_seq_pairs = len(input_seq_pairs) // 2
+
+        input_seq_pairs = [(input_seq_pairs[2 * seq_pair_idx], input_seq_pairs[2 * seq_pair_idx + 1]) for seq_pair_idx in range(num_seq_pairs)]
+    
+    distance_metric = 0; verbose = True
+
+    for input_seq_pair in input_seq_pairs:
+        seq1_hash_code = generate_seq_hash_code(sequence=input_seq_pair[0], verbose=verbose)
+
+        verbose = False if verbose else verbose
+
+        seq2_hash_code = generate_seq_hash_code(sequence=input_seq_pair[1], verbose=verbose)
+
+        if do_binary_wta:
+            hamming_distance = np.count_nonzero(a=seq1_hash_code != seq2_hash_code)
+
+            distance_metric += hamming_distance / (projection_dimension * num_seq_pairs)
+        else:
+            normalized_seq1_hash_code = seq1_hash_code / np.sqrt(np.sum(np.power(seq1_hash_code, 2)))
+            normalized_seq2_hash_code = seq2_hash_code / np.sqrt(np.sum(np.power(seq2_hash_code, 2)))
+
+            cosine_similarity = normalized_seq1_hash_code @ normalized_seq2_hash_code
+
+            distance_metric += cosine_similarity / projection_dimension
+    
+    if do_binary_wta:
+        print(f"For {num_seq_pairs} sequence pairs, mean fractional Hamming distance is {distance_metric}")
+    else:
+        print(f"For {num_seq_pairs} sequence pairs, mean cosine similarity is {distance_metric}")
