@@ -6,8 +6,8 @@ import torch.nn as nn
 import random
 import sys
 
-# Nucleotide base or amino acid residue to index mapping, required for one-hot encoding of sequences
-nucleotides_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+# Nucleotide base or amino acid residue to index mapping, required for one-hot encoding of sequences; maximum length of input sequence allowed for hashing
+nucleotides_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3}; max_sequence_length = 35
 
 # Hyperparameters of 1D convolution module for capturing local k-mer patterns
 conv1d_out_channels = 1; conv1d_kernel_size = 5
@@ -25,8 +25,8 @@ def generate_seq_hash_code(sequence: str, verbose: bool) -> np.ndarray:
     if verbose:
         print(f"generate_seq_hash_code: sequence.length = {len(sequence)}")
     
-    # Generating one-hot encoded feature matrix of input sequence
-    onehot_seq_hash = np.zeros(shape=(len(sequence), len(nucleotides_map)), dtype=np.float32)
+    # Generating one-hot encoded feature matrix of input sequence, with padding in the end if necessary
+    onehot_seq_hash = np.zeros(shape=(max_sequence_length, len(nucleotides_map)), dtype=np.float32)
 
     for seq_pos_idx, nucleotide in enumerate(sequence):
         if nucleotide in nucleotides_map:
@@ -108,7 +108,7 @@ if __name__ == "__main__":
 
             cosine_similarity = normalized_seq1_hash_code @ normalized_seq2_hash_code
 
-            distance_metric += cosine_similarity / projection_dimension
+            distance_metric += cosine_similarity / num_seq_pairs
     
     if do_binary_wta:
         print(f"For {num_seq_pairs} sequence pairs, mean fractional Hamming distance is {distance_metric}")
