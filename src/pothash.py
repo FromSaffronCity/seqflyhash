@@ -1,5 +1,5 @@
 from typing import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
@@ -37,10 +37,10 @@ def preprocess_sequence(sequence: str, should_convert_rna_to_dna: bool = True) -
 def set_seeds_globally_for_reproducibility(seed: int = 42) -> None:
     np.random.seed(seed=seed)
     random.seed(a=seed)
-    torch.manual_seed(seed=seed)
+    torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed=seed)
+        torch.cuda.manual_seed_all(seed)
     
     return None
 
@@ -109,7 +109,7 @@ class MinimizerMasker:
     def __call__(self, sequence: str, hash_function: Callable[[str], int]) -> torch.Tensor:
         sequence = preprocess_sequence(sequence=sequence)
 
-        minimizer_mask = torch.zeros(size=len(sequence), dtype=torch.uint8)
+        minimizer_mask = torch.zeros(size=(len(sequence),), dtype=torch.uint8)
 
         if len(sequence) < self.kmer_size:
             # If the sequence is shorter than the kmer size, return an empty mask
@@ -231,7 +231,7 @@ class SparseRandomProjection(nn.Module):
             raise ValueError("sparsity_threshold must be in [0, 1)")
 
         random_generator = torch.Generator()
-        random_generator.manual_seed(seed=random_seed)
+        random_generator.manual_seed(random_seed)
 
         sparse_random_projection_matrix = torch.randn(size=(out_dim, in_dim), generator=random_generator)
 
@@ -295,7 +295,7 @@ class BlockwiseWTA(nn.Module):
 @dataclass
 class PotHashConfiguration:
     # Input sequence preprocessing
-    alphabet: list[str] = dna_alphabet
+    alphabet: list[str] = field(default_factory=lambda: dna_alphabet.copy())
     should_convert_rna_to_dna: bool = True
     # Optional hard upperbound on sequence length after preprocessing
     max_sequence_length: Optional[int] = None
@@ -483,6 +483,6 @@ if __name__ == "__main__":
 
     print(f"Hashcode shape: {hashcode_1.shape}")
 
-    print(f"Cosine similarity between sequence_1 and sequence_2: {pothash.compute_sequence_similarity(sequence_a=sequence_1, sequence_b=sequence_2, similarity_measurement_metric='cosine')}")
-    print(f"Cosine similarity between sequence_2 and sequence_3: {pothash.compute_sequence_similarity(sequence_a=sequence_2, sequence_b=sequence_3, similarity_measurement_metric='cosine')}")
-    print(f"Cosine similarity between sequence_3 and sequence_1: {pothash.compute_sequence_similarity(sequence_a=sequence_3, sequence_b=sequence_1, similarity_measurement_metric='cosine')}")
+    print(f"Cosine similarity between sequence_1 and sequence_2: {pothash.compute_sequence_similarity(sequence_a=sequence_1, sequence_b=sequence_2, similarity_measurement_metric='cosine'):.4f}")
+    print(f"Cosine similarity between sequence_2 and sequence_3: {pothash.compute_sequence_similarity(sequence_a=sequence_2, sequence_b=sequence_3, similarity_measurement_metric='cosine'):.4f}")
+    print(f"Cosine similarity between sequence_3 and sequence_1: {pothash.compute_sequence_similarity(sequence_a=sequence_3, sequence_b=sequence_1, similarity_measurement_metric='cosine'):.4f}")
