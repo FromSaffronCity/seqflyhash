@@ -477,7 +477,7 @@ if __name__ == "__main__":
 
     sequence_1 = "ACGTACGTACGTACGTACGT"; sequence_2 = "ACGTTCGTAGGTACCTACGA"; sequence_3 = "TGCATGCATGCATGCATGCA"
 
-    hashcode_1 = pothash(sequence_1); hashcode_2 = pothash(sequence_2); hashcode_3 = pothash(sequence_3)
+    hashcode_1 = pothash(sequence=sequence_1); hashcode_2 = pothash(sequence=sequence_2); hashcode_3 = pothash(sequence=sequence_3)
 
     assert hashcode_1.shape == hashcode_2.shape == hashcode_3.shape
 
