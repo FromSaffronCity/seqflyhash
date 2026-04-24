@@ -1,0 +1,8 @@
+# Ignore all files and folders in the project directory
+/*
+
+# Except for the following files and folders
+!.gitignore
+!README.md
+
+!/src/
