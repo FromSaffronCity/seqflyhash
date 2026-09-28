@@ -336,6 +336,9 @@ class PotHashConfiguration:
     convolution_branch_out_channels: int = 16
     should_use_convolution_branch_batchnorm: bool = False
 
+    # Per-sequence standardization of position features, removing base composition effects
+    should_normalize_features_per_sequence: bool = True
+
     # Per-position sparse random projection (FlyHash expansion of every position feature)
     projection_out_dim: int = 2048
     projection_sparsity_threshold: float = 0.9
@@ -458,7 +461,28 @@ class PotHash(nn.Module):
 
         strand_indices, position_indices = torch.nonzero(hashed_position_masks, as_tuple=True)
 
-        return self.position_feature_standardizer(position_features[strand_indices, position_indices]), strand_indices
+        position_features = position_features[strand_indices, position_indices]
+
+        if self.config.should_normalize_features_per_sequence:
+            position_features = self._normalize_features_per_sequence(position_features=position_features, strand_indices=strand_indices, num_sequences=len(sequences))
+
+        return self.position_feature_standardizer(position_features), strand_indices
+
+    @staticmethod
+    def _normalize_features_per_sequence(position_features: torch.Tensor, strand_indices: torch.Tensor, num_sequences: int) -> torch.Tensor:
+        # Standardizes position features with statistics of their own sequence (both strands together, for reverse complement invariance)
+        # This removes shifts caused by the base composition of a genome, which otherwise dominate the pooled codes of unrelated sequences
+        sequence_indices = strand_indices % num_sequences
+
+        position_counts = torch.bincount(sequence_indices, minlength=num_sequences).clamp_min(1).unsqueeze(1).to(position_features.dtype)
+
+        feature_means = torch.zeros(size=(num_sequences, position_features.shape[1]), device=position_features.device, dtype=position_features.dtype).index_add(0, sequence_indices, position_features) / position_counts
+
+        centered_position_features = position_features - feature_means[sequence_indices]
+
+        feature_variances = torch.zeros_like(feature_means).index_add(0, sequence_indices, centered_position_features ** 2) / position_counts
+
+        return centered_position_features / (feature_variances[sequence_indices] + 1e-6).sqrt()
 
     def _pool_position_codes(self, pooled_codes: torch.Tensor, position_count_per_strand: torch.Tensor) -> torch.Tensor:
         # [2B, D] strand codes -> [B, D] sequence codes, combined symmetrically over both strands for reverse complement invariance
