@@ -438,12 +438,12 @@ class PotHash(nn.Module):
 
             return float((normalized_hashcode_a * normalized_hashcode_b).sum().item())
         elif similarity_measurement_metric == "hamming":
-            # Sequence similarity measurement with Hamming distance for binary hashcodes
+            # Sequence similarity measurement with fractional Hamming similarity (1 - normalized Hamming distance) for binary hashcodes
             # Binarization of hashcodes just to make sure the hamming distance is computed on binary hashcodes
             binarized_hashcode_a = (hashcode_a != 0).to(torch.uint8)
             binarized_hashcode_b = (hashcode_b != 0).to(torch.uint8)
 
-            return float((binarized_hashcode_a != binarized_hashcode_b).sum().item())
+            return 1.0 - float((binarized_hashcode_a != binarized_hashcode_b).float().mean().item())
         else:
             raise ValueError("similarity_measurement_metric must be one of {'cosine', 'hamming'}")
 
