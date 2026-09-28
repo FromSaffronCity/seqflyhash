@@ -112,7 +112,7 @@ class MinimizerMasker:
         minimizer_mask = torch.zeros(size=(len(sequence),), dtype=torch.uint8)
 
         if len(sequence) < self.kmer_size:
-            # If the sequence is shorter than the kmer size, return an empty mask
+            # If the sequence is shorter than the kmer size, return an all-zero mask
             return minimizer_mask
         
         kmer_hash_values = []
@@ -128,7 +128,7 @@ class MinimizerMasker:
         num_kmers_per_window = self.window_size - self.kmer_size + 1
 
         if len(kmer_hash_values) < num_kmers_per_window:
-            # If the sequence is shorter than the window size, return an empty mask
+            # If the sequence is shorter than the window size, return an all-zero mask
             return minimizer_mask
         
         best_kmer_starting_positions_seen_so_far = set()
@@ -392,7 +392,8 @@ class PotHash(nn.Module):
             # Here, 1's indicate the positions of submers in the sequence
             encoded_sequence_mask = self.minimizer_masker(sequence=preprocessed_sequence, hash_function=encode_kmer_to_int).to(device)
 
-            if encoded_sequence_mask.numel() > 0:
+            # An all-zero mask means no submer could be selected (sequence shorter than the window or too many unknown bases), so the unmasked encoding is kept
+            if encoded_sequence_mask.any():
                 # encoded_sequence (new): [1, C, L] = encoded_sequence (old): [1, C, L] * encoded_sequence_mask: [L].view(1, 1, -1) -> [1, 1, L]
                 encoded_sequence = encoded_sequence * encoded_sequence_mask.view(1, 1, -1)
             
