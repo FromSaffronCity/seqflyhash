@@ -1,4 +1,3 @@
-from typing import Callable
 from dataclasses import dataclass, field
 import torch.nn.functional as F
 import torch.nn as nn
@@ -12,16 +11,52 @@ from typing import Tuple
 dna_alphabet = ['A', 'C', 'G', 'T']
 
 # Utility functions
-def encode_kmer_to_int(kmer: str) -> int:
-    encoded_kmer = 0
+def convert_sequence_to_base_codes(sequence: str) -> np.ndarray:
+    # A, C, G, T -> 0, 1, 2, 3 and every other character -> 4 (unknown)
+    base_code_lookup_table = np.full(shape=256, fill_value=len(dna_alphabet), dtype=np.int64)
 
-    for base in kmer:
-        encoded_kmer = encoded_kmer * 8
+    for base_code, base in enumerate(dna_alphabet):
+        base_code_lookup_table[ord(base)] = base_code
 
-        # If the base is not in the alphabet, set it to len(dna_alphabet) = 4 (unknown)
-        encoded_kmer = encoded_kmer + (dna_alphabet.index(base) if base in dna_alphabet else len(dna_alphabet))
-    
-    return encoded_kmer
+    return base_code_lookup_table[np.frombuffer(sequence.encode("ascii", errors="replace"), dtype=np.uint8)]
+
+def mix_uint64_hash(values: np.ndarray, seed: int = 0) -> np.ndarray:
+    # SplitMix64 finalizer, a bijective and well-mixing hash on 64-bit integers
+    with np.errstate(over="ignore"):
+        x = values.astype(np.uint64) ^ np.uint64(seed & 0xFFFFFFFFFFFFFFFF)
+        x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+        x = x ^ (x >> np.uint64(31))
+
+    return x
+
+def compute_canonical_kmer_hash_values(base_codes: np.ndarray, kmer_size: int, seed: int = 0) -> np.ndarray:
+    # Returns one hash value per k-mer starting position, identical for a k-mer and its reverse complement
+    # K-mers containing unknown bases get the maximum hash value so that they are never selected as minimizers
+    if kmer_size > 31:
+        raise ValueError("kmer_size must be <= 31 to fit 2-bit k-mer codes into 64 bits")
+
+    num_kmers = len(base_codes) - kmer_size + 1
+
+    if num_kmers <= 0:
+        return np.zeros(shape=(0,), dtype=np.uint64)
+
+    kmer_windows = np.lib.stride_tricks.sliding_window_view(base_codes, window_shape=kmer_size)
+
+    is_invalid_kmer = (kmer_windows == len(dna_alphabet)).any(axis=1)
+
+    clipped_kmer_windows = np.minimum(kmer_windows, 3).astype(np.uint64)
+
+    powers_of_four = np.uint64(4) ** np.arange(kmer_size - 1, -1, -1, dtype=np.uint64)
+
+    forward_kmer_codes = clipped_kmer_windows @ powers_of_four
+    reverse_complement_kmer_codes = (np.uint64(3) - clipped_kmer_windows) @ powers_of_four[:: -1]
+
+    canonical_kmer_hash_values = mix_uint64_hash(values=np.minimum(forward_kmer_codes, reverse_complement_kmer_codes), seed=seed)
+
+    canonical_kmer_hash_values[is_invalid_kmer] = np.iinfo(np.uint64).max
+
+    return canonical_kmer_hash_values
 
 def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,7 +131,7 @@ class LearnedEmbeddingEncoder(nn.Module):
 
 # Submer selection
 class MinimizerMasker:
-    def __init__(self, kmer_size: int = 15, window_size: int = 20):
+    def __init__(self, kmer_size: int = 15, window_size: int = 20, hash_seed: int = 42):
         if kmer_size <= 0 or window_size <= 0:
             raise ValueError("kmer_size and window_size must be > 0")
         
@@ -105,51 +140,46 @@ class MinimizerMasker:
         
         self.kmer_size = kmer_size
         self.window_size = window_size
+        self.hash_seed = hash_seed
 
-    def __call__(self, sequence: str, hash_function: Callable[[str], int]) -> torch.Tensor:
-        sequence = preprocess_sequence(sequence=sequence)
+    def select_minimizer_starting_positions(self, sequence: str) -> np.ndarray:
+        # Canonical minimizers with a random hash: the same k-mers are selected on both strands and selection is not biased towards A-rich k-mers
+        # Returns a boolean array over k-mer starting positions, where ties within a window select every tied position
+        kmer_hash_values = compute_canonical_kmer_hash_values(base_codes=convert_sequence_to_base_codes(sequence=sequence), kmer_size=self.kmer_size, seed=self.hash_seed)
 
-        minimizer_mask = torch.zeros(size=(len(sequence),), dtype=torch.uint8)
-
-        if len(sequence) < self.kmer_size:
-            # If the sequence is shorter than the kmer size, return an all-zero mask
-            return minimizer_mask
-        
-        kmer_hash_values = []
-
-        for kmer_starting_position in range(len(sequence) - self.kmer_size + 1):
-            kmer = sequence[kmer_starting_position: kmer_starting_position + self.kmer_size]
-
-            if 'N' in kmer:
-                kmer_hash_values.append(None)
-            else:
-                kmer_hash_values.append(hash_function(kmer))
-        
         num_kmers_per_window = self.window_size - self.kmer_size + 1
 
+        is_minimizer = np.zeros(shape=(len(kmer_hash_values),), dtype=bool)
+
         if len(kmer_hash_values) < num_kmers_per_window:
-            # If the sequence is shorter than the window size, return an all-zero mask
-            return minimizer_mask
-        
-        best_kmer_starting_positions_seen_so_far = set()
-        
-        for window_starting_position in range(len(kmer_hash_values) - num_kmers_per_window + 1):
-            kmer_hash_values_in_window = kmer_hash_values[window_starting_position: window_starting_position + num_kmers_per_window]
+            return is_minimizer
 
-            valid_kmer_hash_values_in_window = [(window_starting_position + kmer_idx, kmer_hash_value) for kmer_idx, kmer_hash_value in enumerate(kmer_hash_values_in_window) if kmer_hash_value is not None]
+        kmer_hash_value_windows = np.lib.stride_tricks.sliding_window_view(kmer_hash_values, window_shape=num_kmers_per_window)
 
-            if len(valid_kmer_hash_values_in_window) == 0:
-                # If there are no valid kmer hash values in the window, skip this window
-                continue
+        window_minimum_hash_values = kmer_hash_value_windows.min(axis=1)
 
-            best_kmer_starting_position, _ = min(valid_kmer_hash_values_in_window, key=lambda kmer_hash_position_value: kmer_hash_position_value[1])
+        is_window_minimum = (kmer_hash_value_windows == window_minimum_hash_values[:, None]) & (window_minimum_hash_values[:, None] != np.iinfo(np.uint64).max)
 
-            if best_kmer_starting_position not in best_kmer_starting_positions_seen_so_far:
-                best_kmer_starting_positions_seen_so_far.add(best_kmer_starting_position)
+        window_indices, kmer_offsets_in_window = np.nonzero(is_window_minimum)
 
-                minimizer_mask[best_kmer_starting_position: best_kmer_starting_position + self.kmer_size] = 1
-        
-        return minimizer_mask
+        is_minimizer[window_indices + kmer_offsets_in_window] = True
+
+        return is_minimizer
+
+    def __call__(self, sequence: str) -> torch.Tensor:
+        sequence = preprocess_sequence(sequence=sequence)
+
+        is_minimizer = self.select_minimizer_starting_positions(sequence=sequence)
+
+        # Every base covered by a selected minimizer is kept
+        coverage_changes = np.zeros(shape=(len(sequence) + 1,), dtype=np.int64)
+
+        minimizer_starting_positions = np.nonzero(is_minimizer)[0]
+
+        np.add.at(coverage_changes, minimizer_starting_positions, 1)
+        np.add.at(coverage_changes, minimizer_starting_positions + self.kmer_size, -1)
+
+        return torch.from_numpy((np.cumsum(coverage_changes[:-1]) > 0).astype(np.uint8))
 
 # Multi-scale convolution block
 class MultiScaleConvolutionBlock(nn.Module):
@@ -391,7 +421,7 @@ class PotHash(nn.Module):
         if self.config.should_use_submers:
             # Input: L-length sequence -> output: [L] dimensional tensor of 0's and 1's
             # Here, 1's indicate the positions of submers in the sequence
-            encoded_sequence_mask = self.minimizer_masker(sequence=preprocessed_sequence, hash_function=encode_kmer_to_int).to(device)
+            encoded_sequence_mask = self.minimizer_masker(sequence=preprocessed_sequence).to(device)
 
             # An all-zero mask means no submer could be selected (sequence shorter than the window or too many unknown bases), so the unmasked encoding is kept
             if encoded_sequence_mask.any():
