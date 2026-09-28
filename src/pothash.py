@@ -228,6 +228,10 @@ class PositionFeatureStandardizer(nn.Module):
         self.feature_stds.copy_(position_features.std(dim=0).clamp_min(1e-6))
 
     def forward(self, position_features: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            # Batch statistics while training, since the calibrated statistics go stale as the convolution weights change
+            return (position_features - position_features.mean(dim=0)) / position_features.std(dim=0).clamp_min(1e-6)
+
         return (position_features - self.feature_means) / self.feature_stds
 
 # Sketching by sparse random projection
@@ -561,6 +565,189 @@ class PotHash(nn.Module):
         hashcodes = self.forward(sequences=[sequence_a, sequence_b])
 
         return float(self.compute_hashcode_similarity(hashcode_a=hashcodes[0: 1], hashcode_b=hashcodes[1: 2], similarity_measurement_metric=similarity_measurement_metric).item())
+
+# Sequence data utilities for training and evaluation
+def read_fasta_sequences(fasta_file_path: str) -> list[str]:
+    fasta_sequences = []
+    fasta_sequence_lines = []
+
+    with open(file=fasta_file_path, mode='r') as fasta_file:
+        for line in fasta_file:
+            if line.startswith('>'):
+                if len(fasta_sequence_lines) > 0:
+                    fasta_sequences.append(''.join(fasta_sequence_lines))
+
+                fasta_sequence_lines = []
+            else:
+                fasta_sequence_lines.append(line.strip())
+
+    if len(fasta_sequence_lines) > 0:
+        fasta_sequences.append(''.join(fasta_sequence_lines))
+
+    return [preprocess_sequence(sequence=fasta_sequence) for fasta_sequence in fasta_sequences]
+
+def generate_random_sequence(sequence_length: int, random_generator: np.random.Generator, gc_content: float = 0.5) -> str:
+    base_probabilities = [(1 - gc_content) / 2, gc_content / 2, gc_content / 2, (1 - gc_content) / 2]
+
+    return ''.join(random_generator.choice(dna_alphabet, size=sequence_length, p=base_probabilities))
+
+def sample_sequence_windows(source_sequences: Sequence[str], window_length: int, num_windows: int, random_generator: np.random.Generator, max_unknown_base_fraction: float = 0.01) -> list[str]:
+    # Uniformly samples windows (from either strand) out of long source sequences such as genomes, weighted by source sequence length
+    source_sequence_lengths = np.array([len(source_sequence) for source_sequence in source_sequences], dtype=np.float64)
+
+    if (source_sequence_lengths < window_length).all():
+        raise ValueError("every source sequence is shorter than window_length")
+
+    source_sequence_weights = np.clip(source_sequence_lengths - window_length + 1, 0, None)
+    source_sequence_weights = source_sequence_weights / source_sequence_weights.sum()
+
+    sampled_windows = []
+
+    while len(sampled_windows) < num_windows:
+        source_sequence = source_sequences[random_generator.choice(len(source_sequences), p=source_sequence_weights)]
+
+        window_start = int(random_generator.integers(0, len(source_sequence) - window_length + 1))
+
+        window = source_sequence[window_start: window_start + window_length]
+
+        if window.count('N') > max_unknown_base_fraction * window_length:
+            continue
+
+        if random_generator.random() < 0.5:
+            window = window[:: -1].translate(str.maketrans("ACGTN", "TGCAN"))
+
+        sampled_windows.append(window)
+
+    return sampled_windows
+
+def mutate_sequence(sequence: str, mutation_rate: float, random_generator: np.random.Generator, indel_fraction: float = 0.2, max_indel_length: int = 3) -> str:
+    # Simulates evolution: every position mutates with probability mutation_rate, a fraction indel_fraction of mutations being short insertions or deletions
+    # and the rest substitutions to a different base
+    mutated_bases = []
+    position = 0
+
+    mutation_draws = random_generator.random(size=len(sequence))
+
+    while position < len(sequence):
+        if mutation_draws[position] >= mutation_rate:
+            mutated_bases.append(sequence[position])
+            position += 1
+
+            continue
+
+        mutation_type_draw = random_generator.random()
+
+        if mutation_type_draw < 1 - indel_fraction:
+            mutated_bases.append(dna_alphabet[(dna_alphabet.index(sequence[position]) + int(random_generator.integers(1, 4))) % 4] if sequence[position] in dna_alphabet else sequence[position])
+            position += 1
+        elif mutation_type_draw < 1 - indel_fraction / 2:
+            # Insertion before the current position
+            mutated_bases.append(''.join(random_generator.choice(dna_alphabet, size=int(random_generator.integers(1, max_indel_length + 1)))))
+            mutated_bases.append(sequence[position])
+            position += 1
+        else:
+            # Deletion starting at the current position
+            position += int(random_generator.integers(1, max_indel_length + 1))
+
+    return ''.join(mutated_bases)
+
+# Contrastive training of PotHash convolution weights
+@dataclass
+class PotHashTrainingConfiguration:
+    num_training_steps: int = 2000
+    batch_size: int = 32
+    training_window_length: int = 400
+    # Positive pairs are windows and their mutated copies, with mutation rates drawn uniformly from [0, max_mutation_rate]
+    max_mutation_rate: float = 0.3
+    indel_fraction: float = 0.2
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    # Temperature of the InfoNCE loss over cosine similarities
+    contrastive_temperature: float = 0.1
+    random_seed: int = 42
+    log_every_num_steps: int = 50
+
+class PotHashContrastiveTrainer(nn.Module):
+    # Trains the sequence encoder and convolution weights of a PotHash model with a symmetric InfoNCE loss between windows and their mutated copies
+    # The sparse random projection stays fixed, as in FlyHash; the hard per-position WTA is replaced by a softmax while training
+    def __init__(self, base_pothash_model: PotHash, training_config: PotHashTrainingConfiguration):
+        super().__init__()
+
+        self.base_pothash_model = base_pothash_model
+        self.training_config = training_config
+
+    def compute_training_embeddings(self, sequences: Sequence[str]) -> torch.Tensor:
+        pooled_codes = self.base_pothash_model.compute_pooled_codes(sequences=sequences, training_temperature=self.base_pothash_model.config.position_wta_training_temperature)
+
+        # Batch centering plays the role of background centering while training
+        return F.normalize(pooled_codes - pooled_codes.mean(dim=0, keepdim=True), p=2, dim=1, eps=1e-12)
+
+    def compute_contrastive_loss(self, anchor_sequences: Sequence[str], positive_sequences: Sequence[str]) -> Tuple[torch.Tensor, float]:
+        embeddings = self.compute_training_embeddings(sequences=list(anchor_sequences) + list(positive_sequences))
+
+        anchor_embeddings, positive_embeddings = embeddings[: len(anchor_sequences)], embeddings[len(anchor_sequences):]
+
+        similarity_logits = anchor_embeddings @ positive_embeddings.t() / self.training_config.contrastive_temperature
+
+        targets = torch.arange(len(anchor_sequences), device=similarity_logits.device)
+
+        contrastive_loss = 0.5 * (F.cross_entropy(similarity_logits, targets) + F.cross_entropy(similarity_logits.t(), targets))
+
+        retrieval_accuracy = float((similarity_logits.argmax(dim=1) == targets).float().mean().item())
+
+        return contrastive_loss, retrieval_accuracy
+
+    def fit(self, training_source_sequences: Sequence[str], logging_callback=print) -> list[dict]:
+        training_config = self.training_config
+
+        random_generator = np.random.default_rng(seed=training_config.random_seed)
+
+        torch.manual_seed(training_config.random_seed)
+
+        optimizer = torch.optim.AdamW(params=[parameter for parameter in self.base_pothash_model.parameters() if parameter.requires_grad], lr=training_config.learning_rate, weight_decay=training_config.weight_decay)
+
+        learning_rate_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=training_config.num_training_steps)
+
+        training_history = []
+
+        self.base_pothash_model.train()
+
+        for training_step in range(1, training_config.num_training_steps + 1):
+            anchor_sequences = sample_sequence_windows(source_sequences=training_source_sequences, window_length=training_config.training_window_length, num_windows=training_config.batch_size, random_generator=random_generator)
+
+            positive_sequences = [mutate_sequence(sequence=anchor_sequence, mutation_rate=float(random_generator.uniform(0.0, training_config.max_mutation_rate)), random_generator=random_generator, indel_fraction=training_config.indel_fraction) for anchor_sequence in anchor_sequences]
+
+            contrastive_loss, retrieval_accuracy = self.compute_contrastive_loss(anchor_sequences=anchor_sequences, positive_sequences=positive_sequences)
+
+            optimizer.zero_grad()
+            contrastive_loss.backward()
+            optimizer.step()
+            learning_rate_scheduler.step()
+
+            training_history.append({"step": training_step, "loss": float(contrastive_loss.item()), "retrieval_accuracy": retrieval_accuracy})
+
+            if training_step % training_config.log_every_num_steps == 0:
+                recent_history = training_history[-training_config.log_every_num_steps:]
+
+                logging_callback(f"step {training_step}: loss = {np.mean([record['loss'] for record in recent_history]):.4f}, retrieval_accuracy = {np.mean([record['retrieval_accuracy'] for record in recent_history]):.4f}")
+
+        self.base_pothash_model.eval()
+
+        return training_history
+
+def save_pothash_model(pothash_model: PotHash, model_file_path: str) -> None:
+    torch.save({"config": pothash_model.config.__dict__, "state_dict": pothash_model.state_dict()}, model_file_path)
+
+def load_pothash_model(model_file_path: str) -> PotHash:
+    saved_model = torch.load(model_file_path, map_location=get_device(), weights_only=False)
+
+    pothash_model_config = PotHashConfiguration(**saved_model["config"])
+
+    pothash_model = PotHash(config=pothash_model_config).to(device=get_device())
+
+    pothash_model.load_state_dict(saved_model["state_dict"])
+
+    return pothash_model.eval()
 
 # User interface functions
 def build_pothash_evaluation_model(config: Optional[PotHashConfiguration] = None, calibration_sequences: Optional[Sequence[str]] = None) -> PotHash:
