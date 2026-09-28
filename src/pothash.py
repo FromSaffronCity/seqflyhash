@@ -7,18 +7,33 @@ import random
 from typing import Sequence
 import torch
 from typing import Tuple
+from typing import Union
 
 dna_alphabet = ['A', 'C', 'G', 'T']
+
+# Base codes: A, C, G, T -> 0, 1, 2, 3; unknown base -> 4; padding -> 5
+unknown_base_code = len(dna_alphabet)
+padding_base_code = len(dna_alphabet) + 1
 
 # Utility functions
 def convert_sequence_to_base_codes(sequence: str) -> np.ndarray:
     # A, C, G, T -> 0, 1, 2, 3 and every other character -> 4 (unknown)
-    base_code_lookup_table = np.full(shape=256, fill_value=len(dna_alphabet), dtype=np.int64)
+    base_code_lookup_table = np.full(shape=256, fill_value=unknown_base_code, dtype=np.int64)
 
     for base_code, base in enumerate(dna_alphabet):
         base_code_lookup_table[ord(base)] = base_code
 
     return base_code_lookup_table[np.frombuffer(sequence.encode("ascii", errors="replace"), dtype=np.uint8)]
+
+def compute_reverse_complement_base_codes(base_codes: np.ndarray) -> np.ndarray:
+    reverse_complement_base_codes = base_codes[:: -1].copy()
+
+    is_known_base = reverse_complement_base_codes < unknown_base_code
+
+    # A <-> T and C <-> G, since the alphabet order is A, C, G, T
+    reverse_complement_base_codes[is_known_base] = 3 - reverse_complement_base_codes[is_known_base]
+
+    return reverse_complement_base_codes
 
 def mix_uint64_hash(values: np.ndarray, seed: int = 0) -> np.ndarray:
     # SplitMix64 finalizer, a bijective and well-mixing hash on 64-bit integers
@@ -43,7 +58,7 @@ def compute_canonical_kmer_hash_values(base_codes: np.ndarray, kmer_size: int, s
 
     kmer_windows = np.lib.stride_tricks.sliding_window_view(base_codes, window_shape=kmer_size)
 
-    is_invalid_kmer = (kmer_windows == len(dna_alphabet)).any(axis=1)
+    is_invalid_kmer = (kmer_windows >= unknown_base_code).any(axis=1)
 
     clipped_kmer_windows = np.minimum(kmer_windows, 3).astype(np.uint64)
 
@@ -80,6 +95,7 @@ def set_seeds_globally_for_reproducibility(seed: int = 42) -> None:
     return None
 
 # Encoders
+# Both encoders take a [B, L] tensor of base codes and return a [B, C, L] tensor, where padding positions are all-zero columns
 class OneHotEncoder(nn.Module):
     def __init__(self, alphabet: list = dna_alphabet):
         super().__init__()
@@ -87,17 +103,11 @@ class OneHotEncoder(nn.Module):
         self.alphabet = alphabet
         self.num_channels = len(alphabet)
     
-    def forward(self, sequence: str) -> torch.Tensor:
-        sequence = preprocess_sequence(sequence=sequence)
+    def forward(self, base_codes: torch.Tensor) -> torch.Tensor:
+        # Unknown bases and padding become all-zero columns
+        one_hot_encoding = F.one_hot(base_codes, num_classes=self.num_channels + 2)[..., : self.num_channels]
 
-        one_hot_encoding = torch.zeros(size=(1, self.num_channels, len(sequence)), dtype=torch.float32)
-
-        for position, base in enumerate(sequence):
-            if base in self.alphabet:
-                # Unknown bases become all-zero columns
-                one_hot_encoding[0, self.alphabet.index(base), position] = 1.0
-        
-        return one_hot_encoding
+        return one_hot_encoding.permute(0, 2, 1).float()
 
 class LearnedEmbeddingEncoder(nn.Module):
     def __init__(self, alphabet: list = dna_alphabet, embedding_dim: int = 8):
@@ -105,38 +115,25 @@ class LearnedEmbeddingEncoder(nn.Module):
 
         self.alphabet = alphabet
 
-        # One additional embedding for unknown bases
-        self.embedding_table = nn.Embedding(num_embeddings=len(alphabet) + 1, embedding_dim=embedding_dim)
+        # One additional embedding for unknown bases (learned) and one for padding (fixed at zero)
+        self.embedding_table = nn.Embedding(num_embeddings=len(alphabet) + 2, embedding_dim=embedding_dim, padding_idx=len(alphabet) + 1)
     
-    def _convert_sequence_to_indices(self, sequence: str) -> torch.Tensor:
-        sequence = preprocess_sequence(sequence=sequence)
+    def forward(self, base_codes: torch.Tensor) -> torch.Tensor:
+        embedding = self.embedding_table(base_codes)
 
-        base_indices = []
-
-        for base in sequence:
-            if base in self.alphabet:
-                base_indices.append(self.alphabet.index(base))
-            else:
-                # Unknown bases are mapped to the last index and the model will learn around it
-                base_indices.append(len(self.alphabet))
-
-        return torch.tensor(base_indices, dtype=torch.long)
-    
-    def forward(self, sequence: str) -> torch.Tensor:
-        base_indices = self._convert_sequence_to_indices(sequence=sequence).to(self.embedding_table.weight.device)
-
-        embedding = self.embedding_table(base_indices)
-
-        return embedding.transpose(0, 1).unsqueeze(0)
+        return embedding.permute(0, 2, 1)
 
 # Submer selection
 class MinimizerMasker:
-    def __init__(self, kmer_size: int = 15, window_size: int = 20, hash_seed: int = 42):
+    def __init__(self, kmer_size: int = 9, window_size: int = 14, hash_seed: int = 42):
         if kmer_size <= 0 or window_size <= 0:
             raise ValueError("kmer_size and window_size must be > 0")
         
         if kmer_size > window_size:
             raise ValueError("kmer_size must be <= window_size")
+
+        if kmer_size % 2 == 0:
+            raise ValueError("kmer_size must be odd so that submer centers map exactly onto the reverse complement strand")
         
         self.kmer_size = kmer_size
         self.window_size = window_size
@@ -166,28 +163,24 @@ class MinimizerMasker:
 
         return is_minimizer
 
-    def __call__(self, sequence: str) -> torch.Tensor:
-        sequence = preprocess_sequence(sequence=sequence)
+    def __call__(self, sequence: str) -> np.ndarray:
+        # Returns a boolean array over sequence positions marking the centers of the selected submers
+        submer_center_mask = np.zeros(shape=(len(sequence),), dtype=bool)
 
-        is_minimizer = self.select_minimizer_starting_positions(sequence=sequence)
+        submer_center_mask[np.nonzero(self.select_minimizer_starting_positions(sequence=sequence))[0] + self.kmer_size // 2] = True
 
-        # Every base covered by a selected minimizer is kept
-        coverage_changes = np.zeros(shape=(len(sequence) + 1,), dtype=np.int64)
-
-        minimizer_starting_positions = np.nonzero(is_minimizer)[0]
-
-        np.add.at(coverage_changes, minimizer_starting_positions, 1)
-        np.add.at(coverage_changes, minimizer_starting_positions + self.kmer_size, -1)
-
-        return torch.from_numpy((np.cumsum(coverage_changes[:-1]) > 0).astype(np.uint8))
+        return submer_center_mask
 
 # Multi-scale convolution block
 class MultiScaleConvolutionBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int = 8, branch_kernel_sizes: Sequence[int] = (3, 5, 9), should_use_batchnorm: bool = True):
+    def __init__(self, in_channels: int, out_channels: int = 8, branch_kernel_sizes: Sequence[int] = (3, 5, 9), should_use_batchnorm: bool = False):
         super().__init__()
 
         if len(branch_kernel_sizes) == 0:
             raise ValueError("branch_kernel_sizes must be non-empty")
+
+        if any(kernel_size % 2 == 0 for kernel_size in branch_kernel_sizes):
+            raise ValueError("branch_kernel_sizes must be odd so that every position feature is centered on its position")
         
         self.should_use_batchnorm = should_use_batchnorm
 
@@ -219,39 +212,27 @@ class MultiScaleConvolutionBlock(nn.Module):
         
         return torch.cat(tensors=extracted_features, dim=1)
 
-# Pooling and normalization
-class PoolingAndNormalization(nn.Module):
-    def __init__(self, pooling_mode: str = "max_mean", should_l2_normalize: bool = True):
+# Position feature standardization
+class PositionFeatureStandardizer(nn.Module):
+    # Without centering, a few projection units win the per-position WTA for almost every position of every sequence, which makes unrelated sequences look similar
+    def __init__(self, num_features: int):
         super().__init__()
 
-        if pooling_mode not in {"max", "mean", "max_mean"}:
-            raise ValueError("pooling_mode must be one of {'max', 'mean', 'max_mean'}")
-        
-        self.pooling_mode = pooling_mode
-        self.should_l2_normalize = should_l2_normalize
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pooled_features = []
+        self.register_buffer(name="feature_means", tensor=torch.zeros(num_features))
+        self.register_buffer(name="feature_stds", tensor=torch.ones(num_features))
 
-        if self.pooling_mode in {"max", "max_mean"}:
-            pooled_features.append(torch.amax(input=x, dim=-1))
-        
-        if self.pooling_mode in {"mean", "max_mean"}:
-            pooled_features.append(torch.mean(input=x, dim=-1))
-        
-        if len(pooled_features) == 1:
-            y = pooled_features[0]
-        else:
-            y = torch.cat(tensors=pooled_features, dim=-1)
-        
-        if self.should_l2_normalize:
-            y = F.normalize(input=y, p=2, dim=-1, eps=1e-12)
-        
-        return y
+    @torch.no_grad()
+    def calibrate(self, position_features: torch.Tensor) -> None:
+        # position_features: [N, C'] features of background positions
+        self.feature_means.copy_(position_features.mean(dim=0))
+        self.feature_stds.copy_(position_features.std(dim=0).clamp_min(1e-6))
+
+    def forward(self, position_features: torch.Tensor) -> torch.Tensor:
+        return (position_features - self.feature_means) / self.feature_stds
 
 # Sketching by sparse random projection
 class SparseRandomProjection(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, sparsity_threshold: float = 0.9, random_seed: int = 42, is_signed_projection: bool = True):
+    def __init__(self, in_dim: int, out_dim: int, sparsity_threshold: float = 0.9, random_seed: int = 42, is_signed_projection: bool = True, should_normalize_rows: bool = True):
         super().__init__()
 
         if in_dim <= 0 or out_dim <= 0:
@@ -279,6 +260,10 @@ class SparseRandomProjection(nn.Module):
             keeps[torch.arange(out_dim), keep_scores.argmax(dim=1)] = True
 
             sparse_random_projection_matrix = sparse_random_projection_matrix * keeps.float()
+
+        if should_normalize_rows:
+            # Unit-norm rows keep units with more or larger connections from winning the WTA disproportionately often
+            sparse_random_projection_matrix = F.normalize(sparse_random_projection_matrix, p=2, dim=1, eps=1e-12)
         
         self.register_buffer(name="sparse_random_projection_matrix", tensor=sparse_random_projection_matrix)
     
@@ -296,31 +281,32 @@ class BlockwiseWTA(nn.Module):
         self.topk_per_block = topk_per_block
         self.num_blocks = num_blocks
         self.is_binary_sparsification = is_binary_sparsification
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        _, embedding_dim = x.shape
+
+    def select_winners(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Returns the [N, num_blocks * k] flat indices and values of the winners of every block
+        num_rows, embedding_dim = x.shape
 
         if embedding_dim % self.num_blocks != 0:
             raise ValueError("embedding_dim must be divisible by num_blocks")
         
         embedding_block_size = embedding_dim // self.num_blocks
 
-        sparsified_x = torch.zeros_like(input=x)
+        topk_values, topk_indices = torch.topk(input=x.view(num_rows, self.num_blocks, embedding_block_size), k=min(self.topk_per_block, embedding_block_size), dim=2, largest=True, sorted=False)
 
-        for block_idx in range(self.num_blocks):
-            block_starting_position = block_idx * embedding_block_size
-            block_ending_position = block_starting_position + embedding_block_size
+        block_offsets = torch.arange(self.num_blocks, device=x.device).view(1, -1, 1) * embedding_block_size
 
-            embedding_block = x[:, block_starting_position: block_ending_position]
+        winner_indices = (topk_indices + block_offsets).reshape(num_rows, -1)
+        winner_values = topk_values.reshape(num_rows, -1)
 
-            topk_values, topk_indices = torch.topk(input=embedding_block, k=min(self.topk_per_block, embedding_block_size), dim=1, largest=True, sorted=False)
+        if self.is_binary_sparsification:
+            winner_values = torch.ones_like(winner_values)
 
-            if self.is_binary_sparsification:
-                sparsified_x.scatter_(dim=1, index=topk_indices + block_starting_position, src=torch.ones_like(input=topk_values))
-            else:
-                sparsified_x.scatter_(dim=1, index=topk_indices + block_starting_position, src=topk_values)
-        
-        return sparsified_x
+        return winner_indices, winner_values
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        winner_indices, winner_values = self.select_winners(x=x)
+
+        return torch.zeros_like(input=x).scatter_(dim=1, index=winner_indices, src=winner_values)
 
 # PotHash instance configuration
 @dataclass
@@ -331,10 +317,11 @@ class PotHashConfiguration:
     # Optional hard upperbound on sequence length after preprocessing
     max_sequence_length: Optional[int] = None
 
-    # Submer selection
-    should_use_submers: bool = True
-    submer_selection_kmer_size: int = 15
-    submer_selection_window_size: int = 20
+    # Submer selection: only positions at the centers of canonical minimizers are hashed, which is faster and keeps the same positions on both strands
+    should_use_submers: bool = False
+    submer_selection_kmer_size: int = 9
+    submer_selection_window_size: int = 14
+    submer_selection_hash_seed: int = 42
 
     # Sequence embedding
     should_use_sequence_embedding: bool = False
@@ -342,32 +329,45 @@ class PotHashConfiguration:
 
     # Convolution block
     convolution_branch_kernel_sizes: Tuple[int, ...] = (3, 5, 9)
-    convolution_branch_out_channels: int = 8
-    should_use_convolution_branch_batchnorm: bool = True
+    convolution_branch_out_channels: int = 16
+    should_use_convolution_branch_batchnorm: bool = False
 
-    # Pooling and normalization
-    # Available pooling modes: {"max", "mean", "max_mean"}
-    pooling_mode: str = "max_mean"
-    should_l2_normalize_after_pooling: bool = True
-
-    # Sparse random projection
-    projection_out_dim: int = 512
+    # Per-position sparse random projection (FlyHash expansion of every position feature)
+    projection_out_dim: int = 2048
     projection_sparsity_threshold: float = 0.9
     projection_random_seed: int = 42
     is_signed_projection: bool = True
+    should_normalize_projection_rows: bool = True
 
-    # Sparsification with blockwise winners-take-all (WTA)
+    # Per-position winners-take-all (WTA): every position votes for its top-k projection units
+    position_wta_topk: int = 4
+    position_wta_is_binary: bool = False
+    # Softmax temperature replacing the hard per-position WTA during training
+    position_wta_training_temperature: float = 0.1
+
+    # Pooling of per-position codes over positions and both strands
+    # Available pooling modes: {"mean", "max"}
+    pooling_mode: str = "mean"
+
+    # Final sparsification with blockwise winners-take-all (WTA)
     wta_topk_per_block: int = 8
-    wta_num_blocks: int = 8
+    wta_num_blocks: int = 16
     wta_is_binary_sparsification: bool = False
 
     # Miscellaneous
     miscellaneous_random_seed: int = 42
+    # Number of positions projected at once, which bounds memory usage for long sequences
+    position_chunk_size: int = 16384
 
 # Complete PotHash model
+# Sequence -> both strands -> encoding -> multi-scale convolution -> per-position feature standardization -> per-position sparse random projection and WTA
+# -> pooling over positions and both strands -> blockwise WTA -> sparse hashcode that is invariant to sequence length and reverse complementation
 class PotHash(nn.Module):
     def __init__(self, config: PotHashConfiguration):
         super().__init__()
+
+        if config.pooling_mode not in {"mean", "max"}:
+            raise ValueError("pooling_mode must be one of {'mean', 'max'}")
 
         self.config = config
 
@@ -382,23 +382,27 @@ class PotHash(nn.Module):
             sequence_encoder_out_channels = len(config.alphabet)
         
         # Setting up submer selector
-        self.minimizer_masker = MinimizerMasker(kmer_size=config.submer_selection_kmer_size, window_size=config.submer_selection_window_size)
+        self.minimizer_masker = MinimizerMasker(kmer_size=config.submer_selection_kmer_size, window_size=config.submer_selection_window_size, hash_seed=config.submer_selection_hash_seed)
 
         # Setting up multi-scale convolution block
         self.multi_scale_convolution_block: nn.Module = MultiScaleConvolutionBlock(in_channels=sequence_encoder_out_channels, out_channels=config.convolution_branch_out_channels, branch_kernel_sizes=config.convolution_branch_kernel_sizes, should_use_batchnorm=config.should_use_convolution_branch_batchnorm)
 
-        # Setting up pooling and normalization block
-        pooling_out_dim_multiplier = 2 if config.pooling_mode == "max_mean" else 1
-        convolution_block_out_channels = self.multi_scale_convolution_block.out_channels
-        pooling_out_features_dim = pooling_out_dim_multiplier * convolution_block_out_channels
+        # Setting up per-position feature standardizer
+        self.position_feature_standardizer = PositionFeatureStandardizer(num_features=self.multi_scale_convolution_block.out_channels)
 
-        self.pooling_and_normalization_block: nn.Module = PoolingAndNormalization(pooling_mode=config.pooling_mode, should_l2_normalize=config.should_l2_normalize_after_pooling)
+        # Setting up per-position sparse random projector
+        self.sparse_random_projector: nn.Module = SparseRandomProjection(in_dim=self.multi_scale_convolution_block.out_channels, out_dim=config.projection_out_dim, sparsity_threshold=config.projection_sparsity_threshold, random_seed=config.projection_random_seed, is_signed_projection=config.is_signed_projection, should_normalize_rows=config.should_normalize_projection_rows)
 
-        # Setting up sparse random projector
-        self.sparse_random_projector: nn.Module = SparseRandomProjection(in_dim=pooling_out_features_dim, out_dim=config.projection_out_dim, sparsity_threshold=config.projection_sparsity_threshold, random_seed=config.projection_random_seed, is_signed_projection=config.is_signed_projection)
-
-        # Setting up blockwise winners-take-all (WTA) sparsifier
+        # Setting up per-position and final blockwise winners-take-all (WTA) sparsifiers
+        self.position_wta_sparsifier = BlockwiseWTA(topk_per_block=config.position_wta_topk, num_blocks=1, is_binary_sparsification=config.position_wta_is_binary)
         self.blockwise_wta_sparsifier: nn.Module = BlockwiseWTA(topk_per_block=config.wta_topk_per_block, num_blocks=config.wta_num_blocks, is_binary_sparsification=config.wta_is_binary_sparsification)
+
+        # Expected pooled code of background sequences, subtracted before the final WTA so that only units over-represented in a sequence win
+        self.register_buffer(name="background_pooled_code", tensor=torch.zeros(config.projection_out_dim))
+
+    @property
+    def device(self) -> torch.device:
+        return self.sparse_random_projector.sparse_random_projection_matrix.device
     
     @staticmethod
     def _truncate_sequence(sequence: str, max_sequence_length: Optional[int] = None) -> str:
@@ -406,101 +410,173 @@ class PotHash(nn.Module):
             return sequence
         
         return sequence[: max_sequence_length]
+
+    def _prepare_batch(self, sequences: Sequence[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Returns [2B, L_max] base codes and [2B, L_max] boolean masks of hashed positions
+        # Rows 0..B-1 are the forward strands and rows B..2B-1 are the reverse complement strands
+        preprocessed_sequences = [self._truncate_sequence(sequence=preprocess_sequence(sequence=sequence, should_convert_rna_to_dna=self.config.should_convert_rna_to_dna), max_sequence_length=self.config.max_sequence_length) for sequence in sequences]
+
+        max_sequence_length = max(1, max(len(sequence) for sequence in preprocessed_sequences))
+
+        num_sequences = len(preprocessed_sequences)
+
+        base_codes = np.full(shape=(2 * num_sequences, max_sequence_length), fill_value=padding_base_code, dtype=np.int64)
+        hashed_position_masks = np.zeros(shape=(2 * num_sequences, max_sequence_length), dtype=bool)
+
+        for sequence_idx, sequence in enumerate(preprocessed_sequences):
+            sequence_length = len(sequence)
+
+            if sequence_length == 0:
+                continue
+
+            forward_base_codes = convert_sequence_to_base_codes(sequence=sequence)
+
+            base_codes[sequence_idx, : sequence_length] = forward_base_codes
+            base_codes[num_sequences + sequence_idx, : sequence_length] = compute_reverse_complement_base_codes(base_codes=forward_base_codes)
+
+            hashed_position_mask = self.minimizer_masker(sequence=sequence) if self.config.should_use_submers else np.ones(shape=(sequence_length,), dtype=bool)
+
+            if not hashed_position_mask.any():
+                # No submer could be selected (sequence shorter than the window or too many unknown bases), so every position is hashed
+                hashed_position_mask = np.ones(shape=(sequence_length,), dtype=bool)
+
+            hashed_position_masks[sequence_idx, : sequence_length] = hashed_position_mask
+            hashed_position_masks[num_sequences + sequence_idx, : sequence_length] = hashed_position_mask[:: -1]
+
+        return torch.from_numpy(base_codes).to(self.device), torch.from_numpy(hashed_position_masks).to(self.device)
+
+    def compute_position_features(self, sequences: Sequence[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Returns [N, C'] standardized features of all hashed positions and the [N] row indices (into the 2B strands) they belong to
+        base_codes, hashed_position_masks = self._prepare_batch(sequences=sequences)
+
+        # [2B, L] -> [2B, C, L] -> [2B, C', L] -> [2B, L, C']
+        position_features = self.multi_scale_convolution_block(self.sequence_encoder(base_codes)).permute(0, 2, 1)
+
+        strand_indices, position_indices = torch.nonzero(hashed_position_masks, as_tuple=True)
+
+        return self.position_feature_standardizer(position_features[strand_indices, position_indices]), strand_indices
+
+    def _pool_position_codes(self, pooled_codes: torch.Tensor, position_count_per_strand: torch.Tensor) -> torch.Tensor:
+        # [2B, D] strand codes -> [B, D] sequence codes, combined symmetrically over both strands for reverse complement invariance
+        num_sequences = pooled_codes.shape[0] // 2
+
+        if self.config.pooling_mode == "mean":
+            pooled_codes = pooled_codes / position_count_per_strand.clamp_min(1).unsqueeze(1)
+
+            return 0.5 * (pooled_codes[: num_sequences] + pooled_codes[num_sequences:])
+
+        return torch.maximum(pooled_codes[: num_sequences], pooled_codes[num_sequences:])
+
+    def compute_pooled_codes(self, sequences: Union[str, Sequence[str]], training_temperature: Optional[float] = None) -> torch.Tensor:
+        # Returns [B, D] dense pooled codes before the final WTA
+        # With training_temperature, the hard per-position WTA is replaced by a differentiable softmax over projection units
+        if isinstance(sequences, str):
+            sequences = [sequences]
+
+        position_features, strand_indices = self.compute_position_features(sequences=sequences)
+
+        num_strands = 2 * len(sequences)
+
+        position_count_per_strand = torch.bincount(strand_indices, minlength=num_strands).float()
+
+        if training_temperature is not None:
+            if self.config.pooling_mode != "mean":
+                raise ValueError("training requires pooling_mode='mean'")
+
+            position_codes = torch.softmax(self.sparse_random_projector(position_features) / training_temperature, dim=1)
+
+            pooled_codes = torch.zeros(size=(num_strands, self.config.projection_out_dim), device=self.device, dtype=position_codes.dtype).index_add(0, strand_indices, position_codes)
+        else:
+            pooled_codes = torch.zeros(size=(num_strands, self.config.projection_out_dim), device=self.device)
+
+            for chunk_start in range(0, position_features.shape[0], self.config.position_chunk_size):
+                chunk_end = chunk_start + self.config.position_chunk_size
+
+                winner_indices, winner_values = self.position_wta_sparsifier.select_winners(x=self.sparse_random_projector(position_features[chunk_start: chunk_end]))
+
+                chunk_strand_indices = strand_indices[chunk_start: chunk_end].unsqueeze(1).expand_as(winner_indices)
+
+                if self.config.pooling_mode == "mean":
+                    pooled_codes.index_put_((chunk_strand_indices.reshape(-1), winner_indices.reshape(-1)), winner_values.reshape(-1), accumulate=True)
+                else:
+                    pooled_codes[chunk_strand_indices.reshape(-1), winner_indices.reshape(-1)] = torch.maximum(pooled_codes[chunk_strand_indices.reshape(-1), winner_indices.reshape(-1)], winner_values.reshape(-1))
+
+        return self._pool_position_codes(pooled_codes=pooled_codes, position_count_per_strand=position_count_per_strand)
     
-    def _encode_sequence(self, sequence: str) -> torch.Tensor:
-        device = get_device()
+    def forward(self, sequences: Union[str, Sequence[str]]) -> torch.Tensor:
+        # Input: a sequence or a list of B sequences of any lengths -> output: [B, D] sparse hashcodes
+        # D does not depend on sequence lengths, and a sequence and its reverse complement get the same hashcode
+        pooled_codes = F.normalize(self.compute_pooled_codes(sequences=sequences) - self.background_pooled_code, p=2, dim=1, eps=1e-12)
 
-        preprocessed_sequence = self._truncate_sequence(sequence=preprocess_sequence(sequence=sequence, should_convert_rna_to_dna=self.config.should_convert_rna_to_dna), max_sequence_length=self.config.max_sequence_length)
+        return self.blockwise_wta_sparsifier(pooled_codes)
 
-        # Encoding sequence
-        # Input: L-length sequence -> output: [1, C, L] dimensional tensor
-        # Here, C is number of encoding channels (batch size B is 1 here) and L is sequence length after preprocessing and truncation
-        encoded_sequence = self.sequence_encoder(preprocessed_sequence).to(device)
-
-        # Optional masking of sequence encoding by submers selection
-        if self.config.should_use_submers:
-            # Input: L-length sequence -> output: [L] dimensional tensor of 0's and 1's
-            # Here, 1's indicate the positions of submers in the sequence
-            encoded_sequence_mask = self.minimizer_masker(sequence=preprocessed_sequence).to(device)
-
-            # An all-zero mask means no submer could be selected (sequence shorter than the window or too many unknown bases), so the unmasked encoding is kept
-            if encoded_sequence_mask.any():
-                # encoded_sequence (new): [1, C, L] = encoded_sequence (old): [1, C, L] * encoded_sequence_mask: [L].view(1, 1, -1) -> [1, 1, L]
-                encoded_sequence = encoded_sequence * encoded_sequence_mask.view(1, 1, -1)
-            
-        return encoded_sequence
-    
-    def forward(self, sequence: str) -> torch.Tensor:
-        # Input: L-length sequence -> output: [1, C, L] dimensional tensor
-        # Here, C is number of encoding channels (batch size B is 1 here)
-        x = self._encode_sequence(sequence=sequence)
-
-        # Input: [1, C, L] dimensional tensor -> output: [1, C', L] dimensional tensor
-        # Here, C' is number of convolution channels after multi-scale convolution concatenation
-        y = self.multi_scale_convolution_block(x)
-
-        # Input: [1, C', L] dimensional tensor -> output: [1, D_feat] dimensional tensor
-        # Here, D_feat is sequence features dimension after global max/mean pooling along sequence length (L) dimension
-        # D_feat is either C' or 2C' (concatenation of max and mean pooled features if done both)
-        # D_feat does not depend on the length of the sequence L, ensuring that the sequence features dimension is invariant to sequence length
-        y = self.pooling_and_normalization_block(y)
-
-        # Input: [1, D_feat] dimensional tensor -> output: [1, D_proj] dimensional tensor
-        # Here, D_proj is projected dimension after sparse random projection
-        y = self.sparse_random_projector(y)
-
-        # Input: [1, D_proj] dimensional tensor -> output: [1, D_proj] dimensional tensor
-        # Blockwise winners-take-all (WTA) sparsification does not change the projected sequence features dimension D_proj
-        # Regardless of the length of the sequence L, the projected sequence features dimension D_proj is always the same
-        y = self.blockwise_wta_sparsifier(y)
-
-        return y
-    
     @torch.no_grad()
-    def compute_sequence_similarity(self, sequence_a: str, sequence_b: str, similarity_measurement_metric: str = "cosine") -> float:
-        # This function computes the similarity between sequence_a and sequence_b in the hash space
-        hashcode_a = self.forward(sequence=sequence_a)
-        hashcode_b = self.forward(sequence=sequence_b)
+    def hash_sequences(self, sequences: Sequence[str], batch_size: int = 32) -> torch.Tensor:
+        # Hashes many sequences in batches, sorted by length to minimize padding
+        sorted_sequence_indices = sorted(range(len(sequences)), key=lambda sequence_idx: len(sequences[sequence_idx]))
 
+        hashcodes = torch.zeros(size=(len(sequences), self.config.projection_out_dim), device=self.device)
+
+        for batch_start in range(0, len(sequences), batch_size):
+            batch_sequence_indices = sorted_sequence_indices[batch_start: batch_start + batch_size]
+
+            hashcodes[batch_sequence_indices] = self.forward(sequences=[sequences[sequence_idx] for sequence_idx in batch_sequence_indices])
+
+        return hashcodes
+
+    @torch.no_grad()
+    def calibrate_background_statistics(self, sequences: Sequence[str]) -> None:
+        # Estimates per-feature means and standard deviations of hashed positions and the expected pooled code on background sequences
+        self.position_feature_standardizer.feature_means.zero_()
+        self.position_feature_standardizer.feature_stds.fill_(1.0)
+
+        position_features, _ = self.compute_position_features(sequences=sequences)
+
+        self.position_feature_standardizer.calibrate(position_features=position_features)
+
+        self.background_pooled_code.copy_(self.compute_pooled_codes(sequences=sequences).mean(dim=0))
+    
+    @staticmethod
+    def compute_hashcode_similarity(hashcode_a: torch.Tensor, hashcode_b: torch.Tensor, similarity_measurement_metric: str = "cosine") -> torch.Tensor:
+        # Row-wise similarity between [B, D] hashcodes
         if similarity_measurement_metric == "cosine":
             # Sequence similarity measurement with cosine similarity for real-valued hashcodes
-            normalized_hashcode_a = F.normalize(hashcode_a, p=2, dim=-1, eps=1e-12)
-            normalized_hashcode_b = F.normalize(hashcode_b, p=2, dim=-1, eps=1e-12)
-
-            return float((normalized_hashcode_a * normalized_hashcode_b).sum().item())
+            return (F.normalize(hashcode_a, p=2, dim=-1, eps=1e-12) * F.normalize(hashcode_b, p=2, dim=-1, eps=1e-12)).sum(dim=-1)
         elif similarity_measurement_metric == "hamming":
             # Sequence similarity measurement with fractional Hamming similarity (1 - normalized Hamming distance) for binary hashcodes
             # Binarization of hashcodes just to make sure the hamming distance is computed on binary hashcodes
-            binarized_hashcode_a = (hashcode_a != 0).to(torch.uint8)
-            binarized_hashcode_b = (hashcode_b != 0).to(torch.uint8)
+            return 1.0 - ((hashcode_a != 0) != (hashcode_b != 0)).float().mean(dim=-1)
+        elif similarity_measurement_metric == "jaccard":
+            # Jaccard similarity between the sets of active hashcode units
+            binarized_hashcode_a = hashcode_a != 0
+            binarized_hashcode_b = hashcode_b != 0
 
-            return 1.0 - float((binarized_hashcode_a != binarized_hashcode_b).float().mean().item())
+            return (binarized_hashcode_a & binarized_hashcode_b).sum(dim=-1).float() / (binarized_hashcode_a | binarized_hashcode_b).sum(dim=-1).clamp_min(1).float()
         else:
-            raise ValueError("similarity_measurement_metric must be one of {'cosine', 'hamming'}")
+            raise ValueError("similarity_measurement_metric must be one of {'cosine', 'hamming', 'jaccard'}")
 
-# Optional simple contrastive trainer for later downstream sequence similarity learning experiments with PotHash model
-class PotHashContrastiveTrainer(nn.Module):
-    def __init__(self, base_pothash_model: PotHash, trainable_dim: int = 128):
-        super().__init__()
+    @torch.no_grad()
+    def compute_sequence_similarity(self, sequence_a: str, sequence_b: str, similarity_measurement_metric: str = "cosine") -> float:
+        # This function computes the similarity between sequence_a and sequence_b in the hash space
+        hashcodes = self.forward(sequences=[sequence_a, sequence_b])
 
-        self.base_pothash_model = base_pothash_model
-
-        self.pothash_contrastive_learner = nn.Sequential(nn.Linear(in_features=base_pothash_model.config.projection_out_dim, out_features=trainable_dim), nn.ReLU(), nn.Linear(in_features=trainable_dim, out_features=trainable_dim))
-
-    def forward(self, sequence: str) -> torch.Tensor:
-        x = self.base_pothash_model(sequence)
-
-        y = self.pothash_contrastive_learner(x)
-
-        return y
+        return float(self.compute_hashcode_similarity(hashcode_a=hashcodes[0: 1], hashcode_b=hashcodes[1: 2], similarity_measurement_metric=similarity_measurement_metric).item())
 
 # User interface functions
-def build_pothash_evaluation_model() -> PotHash:
-    pothash_model_config = PotHashConfiguration()
+def build_pothash_evaluation_model(config: Optional[PotHashConfiguration] = None, calibration_sequences: Optional[Sequence[str]] = None) -> PotHash:
+    pothash_model_config = config if config is not None else PotHashConfiguration()
 
     set_seeds_globally_for_reproducibility(seed=pothash_model_config.miscellaneous_random_seed)
 
     pothash_model = PotHash(config=pothash_model_config).to(device=get_device()).eval()
+
+    if calibration_sequences is None:
+        # Default background: random sequences with uniform base composition, generated with a fixed seed
+        calibration_random_generator = np.random.default_rng(seed=pothash_model_config.miscellaneous_random_seed)
+
+        calibration_sequences = [''.join(calibration_random_generator.choice(dna_alphabet, size=1000)) for _ in range(20)]
+
+    pothash_model.calibrate_background_statistics(sequences=calibration_sequences)
 
     return pothash_model
 
@@ -509,11 +585,9 @@ if __name__ == "__main__":
 
     sequence_1 = "ACGTACGTACGTACGTACGT"; sequence_2 = "ACGTTCGTAGGTACCTACGA"; sequence_3 = "TGCATGCATGCATGCATGCA"
 
-    hashcode_1 = pothash(sequence=sequence_1); hashcode_2 = pothash(sequence=sequence_2); hashcode_3 = pothash(sequence=sequence_3)
+    hashcodes = pothash(sequences=[sequence_1, sequence_2, sequence_3])
 
-    assert hashcode_1.shape == hashcode_2.shape == hashcode_3.shape
-
-    print(f"Hashcode shape: {hashcode_1.shape}")
+    print(f"Hashcode shape: {hashcodes.shape}")
 
     print(f"Cosine similarity between sequence_1 and sequence_2: {pothash.compute_sequence_similarity(sequence_a=sequence_1, sequence_b=sequence_2, similarity_measurement_metric='cosine'):.4f}")
     print(f"Cosine similarity between sequence_2 and sequence_3: {pothash.compute_sequence_similarity(sequence_a=sequence_2, sequence_b=sequence_3, similarity_measurement_metric='cosine'):.4f}")
