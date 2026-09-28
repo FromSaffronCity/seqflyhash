@@ -233,19 +233,20 @@ class SparseRandomProjection(nn.Module):
         random_generator = torch.Generator()
         random_generator.manual_seed(random_seed)
 
-        sparse_random_projection_matrix = torch.randn(size=(out_dim, in_dim), generator=random_generator)
-
         if is_signed_projection:
-            signs = torch.randint(low=0, high=2, size=(out_dim, in_dim), generator=random_generator, dtype=torch.int64)
-
-            signs = signs.float().mul_(other=2.0).sub_(other=1.0)
-
-            sparse_random_projection_matrix = sparse_random_projection_matrix * signs
+            # Gaussian weights are already symmetric around zero, so no additional random sign flipping is needed
+            sparse_random_projection_matrix = torch.randn(size=(out_dim, in_dim), generator=random_generator)
+        else:
+            # Unsigned projection, i.e. the binary sampling projection of the original FlyHash
+            sparse_random_projection_matrix = torch.ones(size=(out_dim, in_dim))
         
         if sparsity_threshold > 0.0:
-            keeps = torch.rand(size=(out_dim, in_dim), generator=random_generator)
+            keep_scores = torch.rand(size=(out_dim, in_dim), generator=random_generator)
 
-            keeps = keeps > sparsity_threshold
+            keeps = keep_scores > sparsity_threshold
+
+            # Every output unit keeps at least one input connection, otherwise it would be a dead unit that is always zero
+            keeps[torch.arange(out_dim), keep_scores.argmax(dim=1)] = True
 
             sparse_random_projection_matrix = sparse_random_projection_matrix * keeps.float()
         
