@@ -18,9 +18,39 @@ projection_dimension = 1000; sparsification_fraction = 0.1; do_binary_projection
 # Hyperparameters of winner-take-all (WTA) thresholding submodule for sparse hash code generation
 wta_fraction = 0.2; do_binary_wta = False
 
-def generate_seq_hash_code(sequence: str, verbose: bool) -> np.ndarray:
+seq_hash_weight_components = None
+
+def build_seq_hash_weight_components() -> tuple:
+    # Random weight components are generated once with fixed seeds and reused for every sequence
+    global seq_hash_weight_components
+
+    if seq_hash_weight_components is not None:
+        return seq_hash_weight_components
+
     # Setting seeds of pseudo-random number generators for reusing same weight components
     np.random.seed(seed=42); torch.manual_seed(seed=42); random.seed(a=42)
+
+    conv1d = nn.Conv1d(in_channels=len(nucleotides_map), out_channels=conv1d_out_channels, kernel_size=conv1d_kernel_size)
+
+    flat_convoluted_seq_hash_size = conv1d_out_channels * (max_sequence_length - conv1d_kernel_size + 1)
+
+    # Generating projection matrix for eventual expansion of feature vector
+    if do_binary_projection:
+        projection_matrix = np.ones(shape=(projection_dimension, flat_convoluted_seq_hash_size), dtype=np.float32)
+    else:
+        projection_matrix = np.random.normal(loc=0, scale=1, size=(projection_dimension, flat_convoluted_seq_hash_size))
+    
+    for projection_dim_idx in range(projection_dimension):
+        sparsification_indices = random.sample(population=range(flat_convoluted_seq_hash_size), k=int((1 - sparsification_fraction) * flat_convoluted_seq_hash_size))
+
+        projection_matrix[projection_dim_idx, sparsification_indices] = 0
+
+    seq_hash_weight_components = (conv1d, projection_matrix)
+
+    return seq_hash_weight_components
+
+def generate_seq_hash_code(sequence: str, verbose: bool) -> np.ndarray:
+    conv1d, projection_matrix = build_seq_hash_weight_components()
 
     if verbose:
         print(f"generate_seq_hash_code: sequence.length = {len(sequence)}")
@@ -39,31 +69,17 @@ def generate_seq_hash_code(sequence: str, verbose: bool) -> np.ndarray:
         print(f"generate_seq_hash_code: onehot_seq_hash.shape = {onehot_seq_hash.shape}")
     
     # Applying 1D convolution to one-hot encoded feature matrix for capturing local motifs and producing feature map with reduced dimension
-    conv1d = nn.Conv1d(in_channels=len(nucleotides_map), out_channels=conv1d_out_channels, kernel_size=conv1d_kernel_size)
-
-    convoluted_seq_hash = conv1d(torch.from_numpy(onehot_seq_hash.T)).detach().numpy().T
+    with torch.no_grad():
+        convoluted_seq_hash = conv1d(torch.from_numpy(onehot_seq_hash.T)).numpy().T
 
     if verbose:
         print(f"generate_seq_hash_code: convoluted_seq_hash.shape = {convoluted_seq_hash.shape}")
     
     # Flattening feature map to obtain 1-dimensional feature vector
-    flat_convoluted_seq_hash = np.reshape(a=convoluted_seq_hash, newshape=(convoluted_seq_hash.size,))
+    flat_convoluted_seq_hash = convoluted_seq_hash.reshape(-1)
 
     if verbose:
         print(f"generate_seq_hash_code: flat_convoluted_seq_hash.shape = {flat_convoluted_seq_hash.shape}")
-    
-    # Generating projection matrix for eventual expansion of feature vector
-    projection_matrix = None
-
-    if do_binary_projection:
-        projection_matrix = np.ones(shape=(projection_dimension, flat_convoluted_seq_hash.size), dtype=np.float32)
-    else:
-        projection_matrix = np.random.normal(loc=0, scale=1, size=(projection_dimension, flat_convoluted_seq_hash.size))
-    
-    for projection_dim_idx in range(projection_dimension):
-        sparsification_indices = random.sample(population=range(flat_convoluted_seq_hash.size), k=int((1 - sparsification_fraction) * flat_convoluted_seq_hash.size))
-
-        projection_matrix[projection_dim_idx, sparsification_indices] = 0
     
     wta_projected_seq_hash = projection_matrix @ flat_convoluted_seq_hash
 
@@ -106,8 +122,9 @@ if __name__ == "__main__":
 
             distance_metric += hamming_distance / (projection_dimension * num_seq_pairs)
         else:
-            normalized_seq1_hash_code = seq1_hash_code / np.sqrt(np.sum(np.power(seq1_hash_code, 2)))
-            normalized_seq2_hash_code = seq2_hash_code / np.sqrt(np.sum(np.power(seq2_hash_code, 2)))
+            # All-zero hash codes (e.g. empty sequences) are kept at zero instead of producing NaN
+            normalized_seq1_hash_code = seq1_hash_code / max(np.sqrt(np.sum(np.power(seq1_hash_code, 2))), 1e-12)
+            normalized_seq2_hash_code = seq2_hash_code / max(np.sqrt(np.sum(np.power(seq2_hash_code, 2))), 1e-12)
 
             cosine_similarity = normalized_seq1_hash_code @ normalized_seq2_hash_code
 
