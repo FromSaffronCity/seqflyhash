@@ -85,10 +85,10 @@ class LearnedEmbeddingEncoder(nn.Module):
                 # Unknown bases are mapped to the last index and the model will learn around it
                 base_indices.append(len(self.alphabet))
 
-        return torch.tensor(base_indices, dtype=torch.uint8)
+        return torch.tensor(base_indices, dtype=torch.long)
     
     def forward(self, sequence: str) -> torch.Tensor:
-        base_indices = self._convert_sequence_to_indices(sequence=sequence)
+        base_indices = self._convert_sequence_to_indices(sequence=sequence).to(self.embedding_table.weight.device)
 
         embedding = self.embedding_table(base_indices)
 
