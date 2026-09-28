@@ -24,6 +24,9 @@ def generate_seq_hash_code(sequence: str, verbose: bool) -> np.ndarray:
 
     if verbose:
         print(f"generate_seq_hash_code: sequence.length = {len(sequence)}")
+
+    # Uppercasing, RNA to DNA conversion and truncation to the fixed input length of the convolution
+    sequence = sequence.strip().upper().replace('U', 'T')[: max_sequence_length]
     
     # Generating one-hot encoded feature matrix of input sequence, with padding in the end if necessary
     onehot_seq_hash = np.zeros(shape=(max_sequence_length, len(nucleotides_map)), dtype=np.float32)
